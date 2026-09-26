@@ -4,8 +4,8 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
-	"sort"
 )
 
 type Segment struct {
@@ -23,10 +23,6 @@ func WriteSegment(segmentID int, dir string, records [][]byte) (*Segment, error)
 		return nil, err
 	}
 	defer f.Close()
-
-	sort.Slice(records, func(i, j int) bool {
-		return string(records[i]) < string(records[j])
-	})
 
 	writer := bufio.NewWriter(f)
 	for _, rec := range records {
@@ -61,7 +57,7 @@ func ReadSegment(path string) ([][]byte, error) {
 			break
 		}
 		record := make([]byte, length)
-		if _, err := reader.Read(record); err != nil {
+		if _, err := io.ReadFull(reader, record); err != nil {
 			break
 		}
 		records = append(records, record)

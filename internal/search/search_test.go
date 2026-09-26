@@ -4,6 +4,55 @@ import (
 	"testing"
 )
 
+func TestParser(t *testing.T) {
+	p := NewParser()
+
+	ast, err := p.Parse("error AND timeout")
+	if err != nil {
+		t.Errorf("Parse() error = %v", err)
+	}
+	if ast.Type != QueryBoolean || ast.Operator != "AND" {
+		t.Errorf("Expected boolean AND, got %v", ast)
+	}
+
+	ast, err = p.Parse("auth*")
+	if err != nil {
+		t.Errorf("Parse() error = %v", err)
+	}
+	if ast.Type != QueryWildcard {
+		t.Errorf("Expected wildcard, got %v", ast.Type)
+	}
+
+	ast, err = p.Parse("tiemout~1")
+	if err != nil {
+		t.Errorf("Parse() error = %v", err)
+	}
+	if ast.Type != QueryFuzzy {
+		t.Errorf("Expected fuzzy, got %v", ast.Type)
+	}
+
+	_, err = p.Parse("")
+	if err == nil {
+		t.Error("Parse('') should return error")
+	}
+}
+
+func TestWildcardMatch(t *testing.T) {
+	if !WildcardMatch("auth*", "authenticate") {
+		t.Error("WildcardMatch(auth*, authenticate) = false")
+	}
+	if WildcardMatch("auth*", "xyz") {
+		t.Error("WildcardMatch(auth*, xyz) = true")
+	}
+}
+
+func TestParseQueryTerm(t *testing.T) {
+	result := ParseQueryTerm("Error")
+	if result != "error" {
+		t.Errorf("Expected 'error', got %q", result)
+	}
+}
+
 func TestKMP(t *testing.T) {
 	tests := []struct {
 		text    string
@@ -83,53 +132,5 @@ func TestLevenshteinDistance(t *testing.T) {
 		if got != tt.expected {
 			t.Errorf("Levenshtein(%q, %q) = %d, want %d", tt.s1, tt.s2, got, tt.expected)
 		}
-	}
-}
-
-func TestParser(t *testing.T) {
-	p := NewParser()
-	ast, err := p.Parse("error AND timeout")
-	if err != nil {
-		t.Errorf("Parse() error = %v", err)
-	}
-	if ast.Type != QueryBoolean || ast.Operator != "AND" {
-		t.Errorf("Expected boolean AND, got %v", ast)
-	}
-
-	ast, err = p.Parse("auth*")
-	if err != nil {
-		t.Errorf("Parse() error = %v", err)
-	}
-	if ast.Type != QueryWildcard {
-		t.Errorf("Expected wildcard, got %v", ast.Type)
-	}
-
-	ast, err = p.Parse("tiemout~1")
-	if err != nil {
-		t.Errorf("Parse() error = %v", err)
-	}
-	if ast.Type != QueryFuzzy {
-		t.Errorf("Expected fuzzy, got %v", ast.Type)
-	}
-
-	_, err = p.Parse("")
-	if err == nil {
-		t.Error("Parse('') should return error")
-	}
-}
-
-func TestWildcardMatch(t *testing.T) {
-	if !WildcardMatch("auth*", "authenticate") {
-		t.Error("WildcardMatch(auth*, authenticate) = false")
-	}
-	if WildcardMatch("auth*", "xyz") {
-		t.Error("WildcardMatch(auth*, xyz) = true")
-	}
-}
-
-func TestParseQueryTerm(t *testing.T) {
-	result := ParseQueryTerm("Error")
-	if result != "error" {
-		t.Errorf("Expected 'error', got %q", result)
 	}
 }

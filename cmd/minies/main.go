@@ -15,11 +15,26 @@ import (
 	"github.com/rajal-ui/minies/internal/storage"
 )
 
+// flushedRecords returns the set of records already persisted in segments.
+func flushedRecords(segments *storage.SegmentManager) map[string]bool {
+	flushed := make(map[string]bool)
+	for _, seg := range segments.GetSegments() {
+		records, err := storage.ReadSegment(seg.Path)
+		if err != nil {
+			continue
+		}
+		for _, rec := range records {
+			flushed[string(rec)] = true
+		}
+	}
+	return flushed
+}
+
 func main() {
-	listen       := flag.String("listen", ":8080", "Listen address")
-	shards       := flag.Int("shards", 8, "Number of index shards")
-	segmentDir   := flag.String("segment-dir", "./data/segments", "Segment directory")
-	walPath      := flag.String("wal-path", "./data/wal", "WAL directory")
+	listen := flag.String("listen", ":8080", "Listen address")
+	shards := flag.Int("shards", 8, "Number of index shards")
+	segmentDir := flag.String("segment-dir", "./data/segments", "Segment directory")
+	walPath := flag.String("wal-path", "./data/wal", "WAL directory")
 	ramThreshold := flag.String("ram-threshold", "64MB", "RAM threshold before flushing index shards to disk (e.g. 64MB, 256MB)")
 	flag.Parse()
 
@@ -38,19 +53,27 @@ func main() {
 	if err != nil {
 		log.Printf("WAL replay error: %v", err)
 	}
-	_ = records
+
+	// Only recover records that never reached a segment.
+	flushed := flushedRecords(segments)
+	recover := make([][]byte, 0, len(records))
+	for _, rec := range records {
+		if !flushed[string(rec)] {
+			recover = append(recover, rec)
+		}
+	}
 
 	eventLoop := pipeline.NewEventLoop(
 		*shards, idx, trie, flusher, segments, wal,
 	)
+	eventLoop.Recover(recover)
 	eventLoop.Start()
 	defer eventLoop.Stop()
 
 	executor := search.NewExecutor(idx, trie, segments)
-	_ = executor
 
 	go func() {
-		if err := ingest.RunServer(*listen, eventLoop); err != nil {
+		if err := ingest.RunServer(*listen, eventLoop, executor); err != nil {
 			log.Fatalf("server error: %v", err)
 		}
 	}()
@@ -61,6 +84,9 @@ func main() {
 	fmt.Printf("  RAM threshold: %s\n", *ramThreshold)
 	fmt.Printf("  Segments:      %s\n", *segmentDir)
 	fmt.Printf("  WAL:           %s\n", *walPath)
+	if len(recover) > 0 {
+		fmt.Printf("  Recovered:     %d record(s) from WAL\n", len(recover))
+	}
 	fmt.Printf("Press Ctrl+C to stop\n")
 
 	quit := make(chan os.Signal, 1)

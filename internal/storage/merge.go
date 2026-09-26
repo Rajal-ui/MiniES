@@ -30,9 +30,14 @@ func (sm *SegmentManager) loadSegments() {
 			continue
 		}
 		name := e.Name()
-		if len(name) >= 4 && name[:4] == "seg_" {
-			sm.segments = append(sm.segments, &Segment{ID: sm.nextID, Path: sm.dir + "/" + name})
-			sm.nextID++
+		if len(name) >= 8 && name[:8] == "segment_" {
+			id := sm.nextID
+			if n, err := fmt.Sscanf(name, "segment_%d.bin", &id); err == nil && n == 1 {
+				if id >= sm.nextID {
+					sm.nextID = id + 1
+				}
+			}
+			sm.segments = append(sm.segments, &Segment{ID: id, Path: sm.dir + "/" + name})
 		}
 	}
 	sort.Slice(sm.segments, func(i, j int) bool {
@@ -43,6 +48,9 @@ func (sm *SegmentManager) loadSegments() {
 func (sm *SegmentManager) AddSegment(seg *Segment) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	if seg.ID >= sm.nextID {
+		sm.nextID = seg.ID + 1
+	}
 	sm.segments = append(sm.segments, seg)
 }
 
@@ -60,6 +68,19 @@ func (sm *SegmentManager) SegmentCount() int {
 	return len(sm.segments)
 }
 
+func (sm *SegmentManager) Dir() string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.dir
+}
+
+// NextID returns the next segment ID to allocate.
+func (sm *SegmentManager) NextID() int {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.nextID
+}
+
 func (sm *SegmentManager) Compact() ([]*Segment, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -73,7 +94,6 @@ func (sm *SegmentManager) Compact() ([]*Segment, error) {
 			continue
 		}
 		allRecords = append(allRecords, records...)
-		os.Remove(seg.Path)
 	}
 	if len(allRecords) == 0 {
 		return nil, nil
@@ -83,12 +103,15 @@ func (sm *SegmentManager) Compact() ([]*Segment, error) {
 	})
 	newSeg := &Segment{
 		ID:    sm.nextID,
-		Path:  fmt.Sprintf("%s/seg_%06d.bin", sm.dir, sm.nextID),
+		Path:  fmt.Sprintf("%s/segment_%06d.bin", sm.dir, sm.nextID),
 		Count: len(allRecords),
 	}
 	sm.nextID++
 	if err := WriteSegmentFile(newSeg.Path, allRecords); err != nil {
 		return nil, err
+	}
+	for _, seg := range sm.segments {
+		os.Remove(seg.Path)
 	}
 	sm.segments = []*Segment{newSeg}
 	return []*Segment{newSeg}, nil

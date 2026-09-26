@@ -2,6 +2,7 @@ package search
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -23,7 +24,12 @@ type QueryAST struct {
 	Operator string
 }
 
-type Parser struct{}
+// Parser parses a query string into a QueryAST. A Parser keeps per-call
+// state, so calls must not be made concurrently.
+type Parser struct {
+	tokens []string
+	pos    int
+}
 
 func NewParser() *Parser {
 	return &Parser{}
@@ -34,61 +40,136 @@ func (p *Parser) Parse(query string) (*QueryAST, error) {
 	if query == "" {
 		return nil, ErrEmptyQuery
 	}
-	return p.parse(query)
+	tokens := tokenizeQuery(query)
+	p.tokens = tokens
+	p.pos = 0
+	ast, err := p.parseOr()
+	if err != nil {
+		return nil, err
+	}
+	if p.pos < len(p.tokens) {
+		return nil, &QueryError{"unexpected token: " + p.tokens[p.pos]}
+	}
+	return ast, nil
 }
 
-func (p *Parser) parse(query string) (*QueryAST, error) {
-	if strings.Contains(query, " AND ") {
-		parts := strings.SplitN(query, " AND ", 2)
-		left, err := p.parse(parts[0])
-		if err != nil {
-			return nil, err
-		}
-		right, err := p.parse(parts[1])
-		if err != nil {
-			return nil, err
-		}
-		return &QueryAST{Type: QueryBoolean, Left: left, Right: right, Operator: "AND"}, nil
+// parseOr handles the lowest-precedence boolean operator.
+func (p *Parser) parseOr() (*QueryAST, error) {
+	left, err := p.parseAnd()
+	if err != nil {
+		return nil, err
 	}
-	if strings.Contains(query, " OR ") {
-		parts := strings.SplitN(query, " OR ", 2)
-		left, err := p.parse(parts[0])
+	for p.peek() == "OR" {
+		p.pos++
+		right, err := p.parseAnd()
 		if err != nil {
 			return nil, err
 		}
-		right, err := p.parse(parts[1])
-		if err != nil {
-			return nil, err
-		}
-		return &QueryAST{Type: QueryBoolean, Left: left, Right: right, Operator: "OR"}, nil
+		left = &QueryAST{Type: QueryBoolean, Left: left, Right: right, Operator: "OR"}
 	}
-	if strings.Contains(query, " NOT ") {
-		parts := strings.SplitN(query, " NOT ", 2)
-		left, err := p.parse(parts[0])
+	return left, nil
+}
+
+func (p *Parser) parseAnd() (*QueryAST, error) {
+	left, err := p.parseNot()
+	if err != nil {
+		return nil, err
+	}
+	for p.peek() == "AND" {
+		p.pos++
+		right, err := p.parseNot()
 		if err != nil {
 			return nil, err
 		}
-		right, err := p.parse(parts[1])
+		left = &QueryAST{Type: QueryBoolean, Left: left, Right: right, Operator: "AND"}
+	}
+	return left, nil
+}
+
+func (p *Parser) parseNot() (*QueryAST, error) {
+	if p.peek() == "NOT" {
+		p.pos++
+		operand, err := p.parseNot()
 		if err != nil {
 			return nil, err
 		}
-		return &QueryAST{Type: QueryBoolean, Left: left, Right: right, Operator: "NOT"}, nil
+		empty := &QueryAST{Type: QueryExact, Token: ""}
+		return &QueryAST{Type: QueryBoolean, Left: empty, Right: operand, Operator: "NOT"}, nil
 	}
-	if strings.Contains(query, "*") {
-		return &QueryAST{Type: QueryWildcard, Token: strings.TrimSuffix(strings.TrimPrefix(query, "*"), "*")}, nil
+	return p.parsePrimary()
+}
+
+func (p *Parser) parsePrimary() (*QueryAST, error) {
+	tok := p.peek()
+	if tok == "" {
+		return nil, &QueryError{"unexpected end of query"}
 	}
-	if strings.Contains(query, "~") {
-		parts := strings.Split(query, "~")
+	if tok == "(" {
+		p.pos++
+		ast, err := p.parseOr()
+		if err != nil {
+			return nil, err
+		}
+		if p.peek() != ")" {
+			return nil, &QueryError{"missing closing parenthesis"}
+		}
+		p.pos++
+		return ast, nil
+	}
+	if tok == ")" || tok == "AND" || tok == "OR" {
+		return nil, &QueryError{"unexpected token: " + tok}
+	}
+	p.pos++
+	return buildTermAST(tok), nil
+}
+
+func (p *Parser) peek() string {
+	if p.pos < len(p.tokens) {
+		return p.tokens[p.pos]
+	}
+	return ""
+}
+
+// buildTermAST turns a single term into an exact/wildcard/fuzzy leaf node.
+func buildTermAST(term string) *QueryAST {
+	if idx := strings.Index(term, "~"); idx >= 0 {
+		base := term[:idx]
 		k := 1
-		if len(parts) > 1 {
-			k = int(parts[1][0] - '0')
-			if k > 3 {
-				k = 3
-			}
+		if n, err := strconv.Atoi(term[idx+1:]); err == nil {
+			k = n
 		}
-		return &QueryAST{Type: QueryFuzzy, Token: parts[0], Operator: string(rune(k))}, nil
+		if k < 1 {
+			k = 1
+		}
+		if k > 3 {
+			k = 3
+		}
+		if strings.Contains(base, "*") {
+			return &QueryAST{Type: QueryWildcard, Token: base}
+		}
+		return &QueryAST{Type: QueryFuzzy, Token: base, Operator: strconv.Itoa(k)}
 	}
-	return &QueryAST{Type: QueryExact, Token: query}, nil
+	if strings.Contains(term, "*") {
+		return &QueryAST{Type: QueryWildcard, Token: term}
+	}
+	return &QueryAST{Type: QueryExact, Token: term}
+}
+
+var termRe = regexp.MustCompile(`[^\s()]+`)
+
+// tokenizeQuery splits a query into boolean keywords, parentheses and terms.
+// Keywords keep their original case (AND/OR/NOT); terms are lowercased.
+func tokenizeQuery(query string) []string {
+	var tokens []string
+	for _, raw := range termRe.FindAllString(query, -1) {
+		switch raw {
+		case "AND", "OR", "NOT":
+			tokens = append(tokens, raw)
+		default:
+			tokens = append(tokens, strings.ToLower(raw))
+		}
+	}
+	return tokens
 }
 
 var ErrEmptyQuery = &QueryError{"empty query"}

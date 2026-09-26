@@ -1,11 +1,14 @@
 package search
 
 import (
+	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/rajal-ui/minies/internal/index"
 	"github.com/rajal-ui/minies/internal/storage"
+	"github.com/rajal-ui/minies/pkg/logrecord"
 )
 
 type SearchResult struct {
@@ -49,10 +52,16 @@ func (e *Executor) executeAST(node *QueryAST) []SearchResult {
 		results = e.searchWildcard(node.Token)
 	case QueryFuzzy:
 		k := 1
-		if len(node.Operator) > 0 {
-			k = int(node.Operator[0] - '0')
+		if v, err := strconv.Atoi(node.Operator); err == nil {
+			k = v
 		}
-		results = e.searchFuzzy(node.Token, k)
+		if k < 1 {
+			k = 1
+		}
+		if k > 3 {
+			k = 3
+		}
+		results = dedup(e.searchFuzzy(node.Token, k))
 	case QueryBoolean:
 		left := e.executeAST(node.Left)
 		right := e.executeAST(node.Right)
@@ -73,14 +82,23 @@ func (e *Executor) searchExact(token string) []SearchResult {
 	return e.resultsFromPostings(postings, token)
 }
 
-func (e *Executor) searchWildcard(prefix string) []SearchResult {
+func (e *Executor) searchWildcard(pattern string) []SearchResult {
+	// The trie lookup uses the literal prefix before the first '*';
+	// WildcardMatch then enforces the full pattern.
+	prefix := pattern
+	if i := strings.IndexByte(pattern, '*'); i >= 0 {
+		prefix = pattern[:i]
+	}
 	tokens := e.trie.SearchPrefix(prefix)
 	var allResults []SearchResult
 	for _, t := range tokens {
+		if !WildcardMatch(pattern, t) {
+			continue
+		}
 		postings := e.idx.Get(t)
 		allResults = append(allResults, e.resultsFromPostings(postings, t)...)
 	}
-	return allResults
+	return dedup(allResults)
 }
 
 func (e *Executor) searchFuzzy(token string, k int) []SearchResult {
@@ -95,21 +113,67 @@ func (e *Executor) searchFuzzy(token string, k int) []SearchResult {
 }
 
 func (e *Executor) resultsFromPostings(postings []index.Posting, token string) []SearchResult {
-	return nil
+	var results []SearchResult
+	cache := make(map[int][][]byte)
+	seen := make(map[string]bool)
+	for _, p := range postings {
+		if p.SegmentID < 0 {
+			continue
+		}
+		key := fmt.Sprintf("%d:%d", p.SegmentID, p.Offset)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		records, ok := cache[p.SegmentID]
+		if !ok {
+			segPath := fmt.Sprintf("%s/segment_%06d.bin", e.segs.Dir(), p.SegmentID)
+			records, _ = storage.ReadSegment(segPath)
+			cache[p.SegmentID] = records
+		}
+		if p.Offset < 0 || p.Offset >= len(records) {
+			continue
+		}
+		decodeAndAddResult(&results, records[p.Offset])
+	}
+	return results
+}
+
+func decodeAndAddResult(results *[]SearchResult, recordBytes []byte) {
+	var record logrecord.LogRecord
+	err := json.Unmarshal(recordBytes, &record)
+	if err != nil {
+		return
+	}
+
+	*results = append(*results, SearchResult{
+		Service:    record.Service,
+		Level:      string(record.Level),
+		Message:    record.Message,
+		SourceFile: record.SourceFile,
+		LineNo:     record.LineNo,
+		Timestamp:  record.Timestamp,
+		Score:      1.0,
+	})
 }
 
 func resultKey(r SearchResult) string {
-	return r.Service + ":" + r.Message + ":" + strconv.FormatInt(r.Timestamp, 10)
+	return strings.ToLower(r.Service) + ":" + r.SourceFile + ":" + strconv.Itoa(r.LineNo) + ":" +
+		r.Message + ":" + strconv.FormatInt(r.Timestamp, 10)
 }
 
 func intersect(a, b []SearchResult) []SearchResult {
 	result := []SearchResult{}
 	seen := make(map[string]bool)
+	for _, r := range b {
+		seen[resultKey(r)] = true
+	}
 	for _, r := range a {
 		key := resultKey(r)
-		if !seen[key] {
-			seen[key] = true
+		if seen[key] {
 			result = append(result, r)
+			delete(seen, key)
 		}
 	}
 	return result
@@ -118,7 +182,7 @@ func intersect(a, b []SearchResult) []SearchResult {
 func union(a, b []SearchResult) []SearchResult {
 	result := []SearchResult{}
 	seen := make(map[string]bool)
-	for _, r := range append(a, b...) {
+	for _, r := range append(append([]SearchResult{}, a...), b...) {
 		key := resultKey(r)
 		if !seen[key] {
 			seen[key] = true

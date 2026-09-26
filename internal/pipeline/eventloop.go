@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"encoding/json"
 	"sync"
 	"time"
 
@@ -11,17 +12,19 @@ import (
 )
 
 type EventLoop struct {
-	inbound  chan *logrecord.LogRecord
-	workers  int
-	index    *index.InvertedIndex
-	trie     *index.Trie
-	flusher  *storage.Flusher
-	segments *storage.SegmentManager
-	wal      *storage.WAL
-	shutdown chan struct{}
-	wg       sync.WaitGroup
-	mu       sync.RWMutex
-	running  bool
+	inbound        chan *logrecord.LogRecord
+	workers        int
+	index          *index.InvertedIndex
+	trie           *index.Trie
+	flusher        *storage.Flusher
+	segments       *storage.SegmentManager
+	wal            *storage.WAL
+	shutdown       chan struct{}
+	wg             sync.WaitGroup
+	mu             sync.RWMutex
+	stopOnce       sync.Once
+	running        bool
+	pendingRecords [][]byte
 }
 
 func NewEventLoop(
@@ -36,14 +39,15 @@ func NewEventLoop(
 		workers = 1
 	}
 	return &EventLoop{
-		inbound:  make(chan *logrecord.LogRecord, 10000),
-		workers:  workers,
-		index:    idx,
-		trie:     trie,
-		flusher:  flusher,
-		segments: segments,
-		wal:      wal,
-		shutdown: make(chan struct{}),
+		inbound:        make(chan *logrecord.LogRecord, 10000),
+		workers:        workers,
+		index:          idx,
+		trie:           trie,
+		flusher:        flusher,
+		segments:       segments,
+		wal:            wal,
+		shutdown:       make(chan struct{}),
+		pendingRecords: make([][]byte, 0, 1000),
 	}
 }
 
@@ -55,6 +59,7 @@ func (el *EventLoop) Start() {
 		el.wg.Add(1)
 		go el.worker(i)
 	}
+	el.wg.Add(1)
 	go el.flusherLoop()
 }
 
@@ -77,19 +82,32 @@ func (el *EventLoop) processRecord(record *logrecord.LogRecord) {
 	if err := record.Validate(); err != nil {
 		return
 	}
-	if err := el.wal.Append([]byte(record.Message)); err != nil {
+	recordBytes, err := json.Marshal(record)
+	if err != nil {
+		return
+	}
+	if err := el.wal.Append(recordBytes); err != nil {
 		return
 	}
 	el.wal.Flush()
+
+	// Store the full record for later flushing
+	el.mu.Lock()
+	recordIndex := len(el.pendingRecords)
+	el.pendingRecords = append(el.pendingRecords, recordBytes)
+	el.mu.Unlock()
+
 	tokens := record.Tokenize()
 	for _, token := range tokens {
 		normalized := tokenizer.NormalizeToken(token)
-		el.index.Add(normalized, index.Posting{})
+		// Use recordIndex as offset in posting (will be updated with segment ID during flush)
+		el.index.Add(normalized, index.Posting{SegmentID: -1, Offset: recordIndex})
 		el.trie.Insert(normalized)
 	}
 }
 
 func (el *EventLoop) flusherLoop() {
+	defer el.wg.Done()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -104,16 +122,50 @@ func (el *EventLoop) flusherLoop() {
 }
 
 func (el *EventLoop) flushBuffers() {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	if len(el.pendingRecords) == 0 {
+		return
+	}
+	// Hold el.mu for the whole flush so no record can add postings with
+	// SegmentID == -1 while we are remapping them.
+	recordsToFlush := el.pendingRecords
+	el.pendingRecords = make([][]byte, 0, 1000)
+
+	segID := el.segments.NextID()
+	seg, err := storage.WriteSegment(segID, el.segments.Dir(), recordsToFlush)
+	if err != nil {
+		// Put records back so they are retried on the next tick.
+		el.pendingRecords = append(recordsToFlush, el.pendingRecords...)
+		return
+	}
+	el.segments.AddSegment(seg)
+
+	// Point all unflushed postings at the segment that now owns them.
 	for _, shard := range el.index.GetShards() {
-		data := shard.Flush()
-		if len(data) > 0 {
-			var records [][]byte
-			for token := range data {
-				records = append(records, []byte(token))
-			}
-			if len(records) > 0 {
-				el.flusher.Flush(records)
-			}
+		shard.RemapPending(segID)
+	}
+}
+
+// Recover re-adds records that were written to the WAL but never made it
+// into a segment, so they survive a restart. It must be called before Start.
+func (el *EventLoop) Recover(records [][]byte) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	for _, raw := range records {
+		var rec logrecord.LogRecord
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			continue
+		}
+		if err := rec.Validate(); err != nil {
+			continue
+		}
+		recordIndex := len(el.pendingRecords)
+		el.pendingRecords = append(el.pendingRecords, raw)
+		for _, token := range rec.Tokenize() {
+			normalized := tokenizer.NormalizeToken(token)
+			el.index.Add(normalized, index.Posting{SegmentID: -1, Offset: recordIndex})
+			el.trie.Insert(normalized)
 		}
 	}
 }
@@ -128,13 +180,15 @@ func (el *EventLoop) Ingest(record *logrecord.LogRecord) error {
 }
 
 func (el *EventLoop) Stop() {
-	close(el.shutdown)
-	el.flushBuffers()
-	el.wg.Wait()
-	el.wal.Close()
-	el.mu.Lock()
-	el.running = false
-	el.mu.Unlock()
+	el.stopOnce.Do(func() {
+		close(el.shutdown)
+		el.wg.Wait()
+		el.flushBuffers()
+		el.wal.Close()
+		el.mu.Lock()
+		el.running = false
+		el.mu.Unlock()
+	})
 }
 
 func (el *EventLoop) Stats() map[string]int {

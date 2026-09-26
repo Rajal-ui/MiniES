@@ -37,10 +37,27 @@ func (s *Shard) Flush() map[string][]Posting {
 func (s *Shard) Get(token string) []Posting {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if postings, ok := s.buffer[token]; ok {
-		return append([]Posting(nil), postings...)
+	data := s.data[token]
+	buf := s.buffer[token]
+	result := make([]Posting, 0, len(data)+len(buf))
+	result = append(result, data...)
+	result = append(result, buf...)
+	return result
+}
+
+// RemapPending rewrites every unflushed posting (SegmentID == -1) to segID.
+func (s *Shard) RemapPending(segID int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range []map[string][]Posting{s.data, s.buffer} {
+		for _, postings := range m {
+			for i := range postings {
+				if postings[i].SegmentID == -1 {
+					postings[i].SegmentID = segID
+				}
+			}
+		}
 	}
-	return append([]Posting(nil), s.data[token]...)
 }
 
 func (s *Shard) GetAllTokens() []string {

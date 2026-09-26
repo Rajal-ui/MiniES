@@ -3,21 +3,21 @@ package ingest
 import (
 	"encoding/json"
 	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
+	"time"
 
 	"github.com/rajal-ui/minies/internal/pipeline"
+	"github.com/rajal-ui/minies/internal/search"
 	"github.com/rajal-ui/minies/pkg/logrecord"
 )
 
 type Server struct {
 	eventLoop *pipeline.EventLoop
+	executor  *search.Executor
 	addr      string
 }
 
-func NewServer(addr string, eventLoop *pipeline.EventLoop) *Server {
-	return &Server{addr: addr, eventLoop: eventLoop}
+func NewServer(addr string, eventLoop *pipeline.EventLoop, executor *search.Executor) *Server {
+	return &Server{addr: addr, eventLoop: eventLoop, executor: executor}
 }
 
 func (s *Server) HandleIngest(w http.ResponseWriter, r *http.Request) {
@@ -48,12 +48,28 @@ func (s *Server) HandleSearch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing query parameter q", http.StatusBadRequest)
 		return
 	}
+	start := time.Now()
+	results, err := s.executor.Search(query)
+	tookMs := time.Since(start).Milliseconds()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"query":   query,
+			"error":   err.Error(),
+			"results": []interface{}{},
+		})
+		return
+	}
+	if results == nil {
+		results = []search.SearchResult{}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"query":         query,
-		"took_ms":       0,
-		"total_matches": 0,
-		"results":       []interface{}{},
+		"took_ms":       tookMs,
+		"total_matches": len(results),
+		"results":       results,
 	})
 }
 
@@ -68,22 +84,12 @@ func (s *Server) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-func RunServer(addr string, eventLoop *pipeline.EventLoop) error {
-	s := NewServer(addr, eventLoop)
+func RunServer(addr string, eventLoop *pipeline.EventLoop, executor *search.Executor) error {
+	s := NewServer(addr, eventLoop, executor)
 	http.HandleFunc("/ingest", s.HandleIngest)
 	http.HandleFunc("/search", s.HandleSearch)
 	http.HandleFunc("/stats", s.HandleStats)
 	http.HandleFunc("/health", s.HandleHealth)
 
-	go func() {
-		if err := http.ListenAndServe(addr, nil); err != nil && err != http.ErrServerClosed {
-			os.Exit(1)
-		}
-	}()
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	eventLoop.Stop()
-	return nil
+	return http.ListenAndServe(addr, nil)
 }
